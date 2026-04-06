@@ -36,9 +36,7 @@ TARIFFS = {
 }
 
 PROMOCODES = {
-    "GGC10": 10,
-    "GGC20": 20,
-    "NEWYEAR": 15
+    "GGC10": 10
 }
 
 DATA_FILE = "data.json"
@@ -492,7 +490,7 @@ async def handle_tariff(callback: types.CallbackQuery, state: FSMContext):
 async def handle_promo_choice(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "has_promo":
         await callback.message.edit_text(
-            "🎟 *Введите промокод:*\n\nНапишите код в сообщении.\nПример: `GGC10` или `REF123456_7890`\n\nДля отмены введите /cancel",
+            "🎟 *Введите промокод:*\n\nНапишите код в сообщении.\nПример: `GGC70`\n\nДля отмены введите /cancel",
             parse_mode="Markdown"
         )
         await state.set_state(OrderState.entering_promo)
@@ -510,7 +508,6 @@ async def process_promo(message: types.Message, state: FSMContext):
         discount = PROMOCODES[promo]
         await state.update_data(discount=discount, promo_code=promo, is_ref_promo=False)
         await message.answer(f"✅ Промокод применён! Скидка ${discount}")
-        # Отправляем новое сообщение с реквизитами
         await show_payment_info(message, state)
         return
     
@@ -524,7 +521,6 @@ async def process_promo(message: types.Message, state: FSMContext):
                 save_data(data)
                 await state.update_data(discount=discount, promo_code=promo, is_ref_promo=True)
                 await message.answer(f"✅ Реферальный промокод применён! Скидка ${discount}")
-                # Отправляем новое сообщение с реквизитами
                 await show_payment_info(message, state)
                 found = True
                 return
@@ -568,8 +564,7 @@ async def show_payment_info(msg: types.Message, state: FSMContext):
 
 Выберите сеть для оплаты USDT:
 """
-    # Отправляем НОВОЕ сообщение вместо редактирования старого
-    await msg.answer(payment_text, parse_mode="Markdown", reply_markup=keyboard)
+    await msg.edit_text(payment_text, parse_mode="Markdown", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data.startswith("network_"))
 async def handle_network(callback: types.CallbackQuery, state: FSMContext):
