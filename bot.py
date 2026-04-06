@@ -510,6 +510,7 @@ async def process_promo(message: types.Message, state: FSMContext):
         discount = PROMOCODES[promo]
         await state.update_data(discount=discount, promo_code=promo, is_ref_promo=False)
         await message.answer(f"✅ Промокод применён! Скидка ${discount}")
+        # Отправляем новое сообщение с реквизитами
         await show_payment_info(message, state)
         return
     
@@ -523,6 +524,7 @@ async def process_promo(message: types.Message, state: FSMContext):
                 save_data(data)
                 await state.update_data(discount=discount, promo_code=promo, is_ref_promo=True)
                 await message.answer(f"✅ Реферальный промокод применён! Скидка ${discount}")
+                # Отправляем новое сообщение с реквизитами
                 await show_payment_info(message, state)
                 found = True
                 return
@@ -566,7 +568,8 @@ async def show_payment_info(msg: types.Message, state: FSMContext):
 
 Выберите сеть для оплаты USDT:
 """
-    await msg.edit_text(payment_text, parse_mode="Markdown", reply_markup=keyboard)
+    # Отправляем НОВОЕ сообщение вместо редактирования старого
+    await msg.answer(payment_text, parse_mode="Markdown", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data.startswith("network_"))
 async def handle_network(callback: types.CallbackQuery, state: FSMContext):
