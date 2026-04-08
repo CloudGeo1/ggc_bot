@@ -36,9 +36,7 @@ TARIFFS = {
 }
 
 PROMOCODES = {
-    "GGC10": 10,
-    "GGC20": 20,
-    "NEWYEAR": 15
+    "GGC10": 10
 }
 
 DATA_FILE = "data.json"
@@ -492,7 +490,7 @@ async def handle_tariff(callback: types.CallbackQuery, state: FSMContext):
 async def handle_promo_choice(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "has_promo":
         await callback.message.edit_text(
-            "🎟 *Введите промокод:*\n\nНапишите код в сообщении.\nПример: `GGC10` или `REF123456_7890`\n\nДля отмены введите /cancel",
+            "🎟 *Введите промокод:*\n\nНапишите код в сообщении.\nПример: `GGC10`\n\nДля отмены введите /cancel",
             parse_mode="Markdown"
         )
         await state.set_state(OrderState.entering_promo)
