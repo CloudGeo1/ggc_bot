@@ -1,7 +1,7 @@
 import asyncio
-import json
 import os
 import random
+import sqlite3
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -19,6 +19,9 @@ ADMIN_IDS = [605614562, 531226742]
 
 # ПУТЬ К ЛОГОТИПУ
 LOGO_PATH = "logo.png"
+
+# ПУТЬ К БАЗЕ ДАННЫХ НА ПОСТОЯННОМ ДИСКЕ RENDER
+DB_PATH = "/data/ggc.db"
 
 SOCIAL_LINKS = {
     "telegram": "https://t.me/GGCapitalist",
@@ -38,8 +41,6 @@ TARIFFS = {
 PROMOCODES = {
     "GGC10": 10
 }
-
-DATA_FILE = "data.json"
 # =====================================================
 
 bot = Bot(token=BOT_TOKEN)
@@ -54,44 +55,111 @@ class OrderState(StatesGroup):
 class AdminState(StatesGroup):
     waiting_for_link = State()
     waiting_for_mass_message = State()
+    waiting_for_reset_confirmation = State()
 
 class UserState(StatesGroup):
     waiting_for_support_message = State()
 
-def load_data() -> dict:
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"users": {}, "orders": []}
+# ==================== РАБОТА С БАЗОЙ ДАННЫХ ====================
 
-def save_data(data: dict):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def init_db():
+    """Создаёт таблицы в базе данных, если их нет"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Таблица пользователей
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            username TEXT,
+            joined_at TEXT,
+            subscription_end TEXT,
+            ref_code TEXT UNIQUE,
+            ref_by TEXT,
+            ref_count INTEGER DEFAULT 0,
+            ref_monthly_count INTEGER DEFAULT 0,
+            ref_monthly_reset TEXT,
+            ref_free_month_used INTEGER DEFAULT 0
+        )
+    ''')
+    
+    # Таблица промокодов (реферальных)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ref_promocodes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            code TEXT UNIQUE,
+            discount INTEGER,
+            created_at TEXT,
+            used INTEGER DEFAULT 0,
+            from_user TEXT
+        )
+    ''')
+    
+    # Таблица заявок
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id INTEGER PRIMARY KEY,
+            user_id TEXT,
+            username TEXT,
+            tariff TEXT,
+            price REAL,
+            network TEXT,
+            status TEXT,
+            created_at TEXT,
+            promo TEXT
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+def reset_db():
+    """Полностью очищает базу данных (удаляет все таблицы и создаёт заново)"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Удаляем все таблицы
+    cursor.execute("DROP TABLE IF EXISTS users")
+    cursor.execute("DROP TABLE IF EXISTS ref_promocodes")
+    cursor.execute("DROP TABLE IF EXISTS orders")
+    
+    conn.commit()
+    conn.close()
+    
+    # Создаём таблицы заново
+    init_db()
+
+def get_connection():
+    """Возвращает соединение с базой данных"""
+    return sqlite3.connect(DB_PATH)
+
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
 def generate_ref_code(user_id: int) -> str:
     return f"ref_{user_id}"
 
 def get_user_by_ref_code(ref_code: str) -> Optional[str]:
-    data = load_data()
-    for user_id, user_data in data["users"].items():
-        if user_data.get("ref_code") == ref_code:
-            return user_id
-    return None
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id FROM users WHERE ref_code = ?", (ref_code,))
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
 
 def reset_monthly_ref_counts():
-    data = load_data()
-    now = datetime.now()
-    for user_id, user_data in data["users"].items():
-        last_reset = user_data.get("ref_monthly_reset")
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute("SELECT user_id, ref_monthly_reset FROM users")
+    rows = cursor.fetchall()
+    for user_id, last_reset in rows:
         if last_reset:
             last_reset_date = datetime.fromisoformat(last_reset)
-            if (now - last_reset_date).days >= 30:
-                user_data["ref_monthly_count"] = 0
-                user_data["ref_monthly_reset"] = now.isoformat()
-        else:
-            user_data["ref_monthly_reset"] = now.isoformat()
-            user_data["ref_monthly_count"] = 0
-    save_data(data)
+            if (datetime.now() - last_reset_date).days >= 30:
+                cursor.execute("UPDATE users SET ref_monthly_count = 0, ref_monthly_reset = ? WHERE user_id = ?", (now, user_id))
+    conn.commit()
+    conn.close()
 
 # ==================== КЛАВИАТУРЫ ====================
 
@@ -240,57 +308,115 @@ async def send_welcome_with_logo(target, username: str):
             reply_markup=get_bottom_keyboard()
         )
 
+# КОМАНДА ДЛЯ СБРОСА БАЗЫ ДАННЫХ (ТОЛЬКО ДЛЯ АДМИНОВ)
+@dp.message(Command("reset_db"))
+async def cmd_reset_db(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ ДА, УДАЛИТЬ ВСЁ", callback_data="reset_confirm")],
+        [InlineKeyboardButton(text="❌ ОТМЕНА", callback_data="reset_cancel")]
+    ])
+    
+    await message.answer(
+        "⚠️ *ВНИМАНИЕ!*\n\n"
+        "Вы собираетесь полностью очистить базу данных.\n\n"
+        "Будут удалены:\n"
+        "• Все пользователи\n"
+        "• Все подписки\n"
+        "• Все заявки\n"
+        "• Все реферальные промокоды\n\n"
+        "Это действие НЕЛЬЗЯ отменить.\n\n"
+        "Вы уверены?",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    await state.set_state(AdminState.waiting_for_reset_confirmation)
+
+@dp.callback_query(lambda c: c.data == "reset_confirm")
+async def reset_confirm(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    # Очищаем базу данных
+    reset_db()
+    
+    await callback.message.edit_text(
+        "✅ *База данных полностью очищена!*\n\n"
+        "Бот готов к релизу. Все тестовые данные удалены.",
+        parse_mode="Markdown",
+        reply_markup=get_back_keyboard()
+    )
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data == "reset_cancel")
+async def reset_cancel(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "❌ Очистка базы данных отменена.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard()
+    )
+    await state.clear()
+    await callback.answer()
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
-    user_id = message.from_user.id
+    user_id = str(message.from_user.id)
     username = message.from_user.username or message.from_user.first_name
     
     ref_code = None
     if message.text and " " in message.text:
         ref_code = message.text.split(" ", 1)[1]
     
-    data = load_data()
-    if str(user_id) not in data["users"]:
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Проверяем, существует ли пользователь
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    user_exists = cursor.fetchone()
+    
+    if not user_exists:
         invited_by = None
         if ref_code:
             inviter_id = get_user_by_ref_code(ref_code)
-            if inviter_id and inviter_id != str(user_id):
+            if inviter_id and inviter_id != user_id:
                 invited_by = inviter_id
         
-        data["users"][str(user_id)] = {
-            "username": username,
-            "joined_at": datetime.now().isoformat(),
-            "subscription_end": None,
-            "ref_code": generate_ref_code(user_id),
-            "ref_by": invited_by,
-            "ref_count": 0,
-            "ref_monthly_count": 0,
-            "ref_monthly_reset": datetime.now().isoformat(),
-            "ref_promocodes": [],
-            "ref_free_month_used": False
-        }
+        # Создаём пользователя
+        ref_code_gen = generate_ref_code(int(user_id))
+        now_str = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO users (user_id, username, joined_at, subscription_end, ref_code, ref_by, ref_monthly_reset)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (user_id, username, now_str, None, ref_code_gen, invited_by, now_str))
         
         if invited_by:
-            inviter = data["users"].get(invited_by, {})
-            inviter["ref_count"] = inviter.get("ref_count", 0) + 1
-            inviter["ref_monthly_count"] = inviter.get("ref_monthly_count", 0) + 1
+            # Увеличиваем счётчик приглашений
+            cursor.execute("UPDATE users SET ref_count = ref_count + 1, ref_monthly_count = ref_monthly_count + 1 WHERE user_id = ?", (invited_by,))
             
-            last_reset = inviter.get("ref_monthly_reset")
-            if last_reset:
-                last_reset_date = datetime.fromisoformat(last_reset)
+            # Проверяем сброс месячного счётчика
+            cursor.execute("SELECT ref_monthly_reset FROM users WHERE user_id = ?", (invited_by,))
+            last_reset_row = cursor.fetchone()
+            if last_reset_row and last_reset_row[0]:
+                last_reset_date = datetime.fromisoformat(last_reset_row[0])
                 if (datetime.now() - last_reset_date).days >= 30:
-                    inviter["ref_monthly_count"] = 1
-                    inviter["ref_monthly_reset"] = datetime.now().isoformat()
+                    cursor.execute("UPDATE users SET ref_monthly_count = 1, ref_monthly_reset = ? WHERE user_id = ?", (datetime.now().isoformat(), invited_by))
             
+            # Генерируем промокод для пригласившего
             promo_code = f"REF{user_id}_{random.randint(1000, 9999)}"
-            inviter["ref_promocodes"].append({
-                "code": promo_code,
-                "discount": 10,
-                "created_at": datetime.now().isoformat(),
-                "used": False,
-                "from_user": username
-            })
+            cursor.execute('''
+                INSERT INTO ref_promocodes (user_id, code, discount, created_at, from_user)
+                VALUES (?, ?, ?, ?, ?)
+            ''', (invited_by, promo_code, 10, datetime.now().isoformat(), username))
             
             try:
                 await bot.send_message(
@@ -298,15 +424,18 @@ async def cmd_start(message: types.Message, state: FSMContext):
                     f"🎉 *Новый реферал!*\n\n"
                     f"Пользователь @{username} перешёл по вашей ссылке!\n"
                     f"Вы получили промокод на скидку 10$: `{promo_code}`\n\n"
-                    f"Всего приглашений: {inviter['ref_count']}\n"
-                    f"За этот месяц: {inviter['ref_monthly_count']}",
+                    f"Всего приглашений: (обновится позже)\n"
+                    f"За этот месяц: (обновится позже)",
                     parse_mode="Markdown"
                 )
             except:
                 pass
             
-            if inviter["ref_monthly_count"] >= 3 and not inviter.get("ref_free_month_used"):
-                current_end = inviter.get("subscription_end")
+            # Проверяем, не набрал ли пригласивший 3 реферала за месяц
+            cursor.execute("SELECT ref_monthly_count, ref_free_month_used, subscription_end FROM users WHERE user_id = ?", (invited_by,))
+            inviter_data = cursor.fetchone()
+            if inviter_data and inviter_data[0] >= 3 and not inviter_data[1]:
+                current_end = inviter_data[2]
                 if current_end:
                     end_date = datetime.fromisoformat(current_end)
                     if end_date > datetime.now():
@@ -316,8 +445,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 else:
                     new_end = datetime.now() + timedelta(days=30)
                 
-                inviter["subscription_end"] = new_end.isoformat()
-                inviter["ref_free_month_used"] = True
+                cursor.execute("UPDATE users SET subscription_end = ?, ref_free_month_used = 1 WHERE user_id = ?", (new_end.isoformat(), invited_by))
                 
                 try:
                     await bot.send_message(
@@ -331,8 +459,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 except:
                     pass
         
-        save_data(data)
+        conn.commit()
     
+    conn.close()
     await send_welcome_with_logo(message, username)
 
 @dp.message(lambda message: message.text == "🏠 Главное меню")
@@ -354,9 +483,13 @@ async def handle_bottom_buttons(message: types.Message, state: FSMContext):
     elif text == "👥 Рефералка":
         await show_referral_info(message, message.from_user.id)
     elif text == "👤 Статус":
-        data = load_data()
-        user_id = str(message.from_user.id)
-        sub_end = data["users"].get(user_id, {}).get("subscription_end")
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT subscription_end FROM users WHERE user_id = ?", (str(message.from_user.id),))
+        row = cursor.fetchone()
+        conn.close()
+        
+        sub_end = row[0] if row else None
         
         if sub_end:
             end_date = datetime.fromisoformat(sub_end)
@@ -395,14 +528,20 @@ async def cancel_action(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 async def show_referral_info(msg: types.Message, user_id: int):
-    data = load_data()
-    user_data = data["users"].get(str(user_id), {})
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT ref_code, ref_count, ref_monthly_count, ref_free_month_used FROM users WHERE user_id = ?", (str(user_id),))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        await msg.answer("Ошибка: пользователь не найден")
+        return
+    
+    ref_code, ref_count, ref_monthly, free_month_used = row
     
     bot_username = (await bot.get_me()).username
-    ref_link = f"https://t.me/{bot_username}?start={user_data.get('ref_code', '')}"
-    ref_count = user_data.get("ref_count", 0)
-    ref_monthly = user_data.get("ref_monthly_count", 0)
-    free_month_used = user_data.get("ref_free_month_used", False)
+    ref_link = f"https://t.me/{bot_username}?start={ref_code}"
     
     text = f"""
 👥 *Реферальная программа GGC*
@@ -431,10 +570,18 @@ async def show_referral_info(msg: types.Message, user_id: int):
 
 @dp.callback_query(lambda c: c.data == "copy_ref_link")
 async def copy_ref_link(callback: types.CallbackQuery):
-    data = load_data()
-    user_data = data["users"].get(str(callback.from_user.id), {})
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT ref_code FROM users WHERE user_id = ?", (str(callback.from_user.id),))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    
     bot_username = (await bot.get_me()).username
-    ref_link = f"https://t.me/{bot_username}?start={user_data.get('ref_code', '')}"
+    ref_link = f"https://t.me/{bot_username}?start={row[0]}"
     
     await callback.answer(f"Ссылка скопирована!", show_alert=False)
     await callback.message.answer(
@@ -444,18 +591,20 @@ async def copy_ref_link(callback: types.CallbackQuery):
 
 @dp.callback_query(lambda c: c.data == "my_promocodes")
 async def my_promocodes(callback: types.CallbackQuery):
-    data = load_data()
-    user_data = data["users"].get(str(callback.from_user.id), {})
-    promocodes = user_data.get("ref_promocodes", [])
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT code, discount, created_at, used FROM ref_promocodes WHERE user_id = ? ORDER BY created_at DESC", (str(callback.from_user.id),))
+    rows = cursor.fetchall()
+    conn.close()
     
-    active_codes = [p for p in promocodes if not p.get("used", False)]
+    active_codes = [row for row in rows if not row[3]]
     
     if not active_codes:
         text = "🎟 *Ваши промокоды*\n\nУ вас пока нет активных промокодов.\nПригласите друга, и вы получите скидку 10$!"
     else:
         text = "🎟 *Ваши промокоды:*\n\n"
         for p in active_codes:
-            text += f"• `{p['code']}` — скидка ${p['discount']} (от {p['created_at'][:10]})\n"
+            text += f"• `{p[0]}` — скидка ${p[1]} (от {p[2][:10]})\n"
         text += "\n*Как использовать:*\nПри оформлении подписки введите промокод в специальное поле."
     
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_referral_keyboard())
@@ -490,7 +639,7 @@ async def handle_tariff(callback: types.CallbackQuery, state: FSMContext):
 async def handle_promo_choice(callback: types.CallbackQuery, state: FSMContext):
     if callback.data == "has_promo":
         await callback.message.edit_text(
-            "🎟 *Введите промокод:*\n\nНапишите код в сообщении.\nПример: `GGC70`\n\nДля отмены введите /cancel",
+            "🎟 *Введите промокод:*\n\nНапишите код в сообщении.\n\nДля отмены введите /cancel",
             parse_mode="Markdown"
         )
         await state.set_state(OrderState.entering_promo)
@@ -511,29 +660,31 @@ async def process_promo(message: types.Message, state: FSMContext):
         await show_payment_info(message, state)
         return
     
-    data = load_data()
-    found = False
-    for user_id, user_data in data["users"].items():
-        for p in user_data.get("ref_promocodes", []):
-            if p.get("code") == promo and not p.get("used", False):
-                discount = p.get("discount", 10)
-                p["used"] = True
-                save_data(data)
-                await state.update_data(discount=discount, promo_code=promo, is_ref_promo=True)
-                await message.answer(f"✅ Реферальный промокод применён! Скидка ${discount}")
-                await show_payment_info(message, state)
-                found = True
-                return
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, discount FROM ref_promocodes WHERE code = ? AND used = 0", (promo,))
+    row = cursor.fetchone()
     
-    if not found:
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Попробовать другой", callback_data="has_promo")],
-            [InlineKeyboardButton(text="🚫 Продолжить без промокода", callback_data="no_promo")]
-        ])
-        await message.answer(
-            f"❌ Промокод «{promo}» не найден или уже использован.\n\nПопробуйте другой или продолжите без скидки.",
-            reply_markup=keyboard
-        )
+    if row:
+        discount = row[1]
+        cursor.execute("UPDATE ref_promocodes SET used = 1 WHERE code = ?", (promo,))
+        conn.commit()
+        await state.update_data(discount=discount, promo_code=promo, is_ref_promo=True)
+        await message.answer(f"✅ Реферальный промокод применён! Скидка ${discount}")
+        await show_payment_info(message, state)
+        conn.close()
+        return
+    
+    conn.close()
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Попробовать другой", callback_data="has_promo")],
+        [InlineKeyboardButton(text="🚫 Продолжить без промокода", callback_data="no_promo")]
+    ])
+    await message.answer(
+        f"❌ Промокод «{promo}» не найден или уже использован.\n\nПопробуйте другой или продолжите без скидки.",
+        reply_markup=keyboard
+    )
 
 async def show_payment_info(msg: types.Message, state: FSMContext):
     data = await state.get_data()
@@ -564,7 +715,7 @@ async def show_payment_info(msg: types.Message, state: FSMContext):
 
 Выберите сеть для оплаты USDT:
 """
-    await msg.edit_text(payment_text, parse_mode="Markdown", reply_markup=keyboard)
+    await msg.answer(payment_text, parse_mode="Markdown", reply_markup=keyboard)
 
 @dp.callback_query(lambda c: c.data.startswith("network_"))
 async def handle_network(callback: types.CallbackQuery, state: FSMContext):
@@ -610,30 +761,31 @@ async def handle_paid(callback: types.CallbackQuery, state: FSMContext):
 async def process_screenshot(message: types.Message, state: FSMContext):
     data = await state.get_data()
     
-    order = {
-        "order_id": data["order_id"],
-        "user_id": message.from_user.id,
-        "username": message.from_user.username or message.from_user.first_name,
-        "tariff": data["tariff"],
-        "price": data["final_price"],
-        "network": data.get("network"),
-        "status": "pending",
-        "created_at": datetime.now().isoformat(),
-        "promo": data.get("promo_code")
-    }
+    order_id = data["order_id"]
+    user_id = str(message.from_user.id)
+    username = message.from_user.username or message.from_user.first_name
+    tariff = data["tariff"]
+    price = data["final_price"]
+    network = data.get("network")
+    promo = data.get("promo_code")
     
-    all_data = load_data()
-    all_data["orders"].append(order)
-    save_data(all_data)
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO orders (order_id, user_id, username, tariff, price, network, status, created_at, promo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (order_id, user_id, username, tariff, price, network, "pending", datetime.now().isoformat(), promo))
+    conn.commit()
+    conn.close()
     
     admin_text = f"""
-🆕 *НОВАЯ ЗАЯВКА #{order['order_id']}*
+🆕 *НОВАЯ ЗАЯВКА #{order_id}*
 
-👤 Пользователь: @{order['username']} (ID: {order['user_id']})
-💰 Тариф: {TARIFFS[order['tariff']]['name']}
-💵 Сумма: ${order['price']} USDT
-🌐 Сеть: {order['network']}
-🎟 Промокод: {order.get('promo', 'нет')}
+👤 Пользователь: @{username} (ID: {user_id})
+💰 Тариф: {TARIFFS[tariff]['name']}
+💵 Сумма: ${price} USDT
+🌐 Сеть: {network}
+🎟 Промокод: {promo if promo else 'нет'}
 
 ✅ Статус: ожидает подтверждения
 """
@@ -681,18 +833,23 @@ async def admin_view_orders(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    data = load_data()
-    pending_orders = [o for o in data["orders"] if o["status"] == "pending"]
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT order_id, username, price FROM orders WHERE status = 'pending'")
+    pending_orders = cursor.fetchall()
+    conn.close()
+    
     if not pending_orders:
         await callback.message.edit_text("📭 *Нет новых заявок*", parse_mode="Markdown", reply_markup=get_admin_keyboard())
     else:
         text = "📋 *Заявки на подтверждение:*\n\n"
         for o in pending_orders:
-            text += f"🆕 #{o['order_id']} | @{o['username']} | ${o['price']}\n"
+            text += f"🆕 #{o[0]} | @{o[1]} | ${o[2]}\n"
         
         builder = InlineKeyboardBuilder()
         for o in pending_orders:
-            builder.button(text=f"#{o['order_id']} - @{o['username']}", callback_data=f"approve_{o['order_id']}")
+            builder.button(text=f"#{o[0]} - @{o[1]}", callback_data=f"approve_{o[0]}")
         builder.button(text="◀️ Назад", callback_data="back_to_menu")
         builder.adjust(1)
         
@@ -743,32 +900,38 @@ async def process_admin_link(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    all_data = load_data()
-    order = next((o for o in all_data["orders"] if o["order_id"] == order_id), None)
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT user_id, username, tariff FROM orders WHERE order_id = ? AND status = 'pending'", (order_id,))
+    order = cursor.fetchone()
     
     if not order:
-        await message.answer(f"❌ Заявка #{order_id} не найдена")
+        await message.answer(f"❌ Заявка #{order_id} не найдена или уже обработана")
+        conn.close()
         await state.clear()
         return
     
-    if order["status"] != "pending":
-        await message.answer(f"❌ Заявка #{order_id} уже обработана (статус: {order['status']})")
-        await state.clear()
-        return
+    user_id, username, tariff_key = order
     
-    order["status"] = "approved"
-    order["approved_at"] = datetime.now().isoformat()
+    # Обновляем статус заявки
+    cursor.execute("UPDATE orders SET status = 'approved' WHERE order_id = ?", (order_id,))
     
-    user_id = str(order["user_id"])
-    tariff = TARIFFS[order["tariff"]]
+    # Активируем подписку
+    tariff = TARIFFS[tariff_key]
     end_date = datetime.now() + timedelta(days=tariff["days"])
     
-    if user_id not in all_data["users"]:
-        all_data["users"][user_id] = {"username": order["username"], "joined_at": datetime.now().isoformat()}
+    cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (user_id,))
+    if not cursor.fetchone():
+        cursor.execute('''
+            INSERT INTO users (user_id, username, joined_at, subscription_end, ref_code)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (user_id, username, datetime.now().isoformat(), end_date.isoformat(), generate_ref_code(int(user_id))))
+    else:
+        cursor.execute("UPDATE users SET subscription_end = ? WHERE user_id = ?", (end_date.isoformat(), user_id))
     
-    all_data["users"][user_id]["subscription_end"] = end_date.isoformat()
-    all_data["users"][user_id]["active_tariff"] = order["tariff"]
-    save_data(all_data)
+    conn.commit()
+    conn.close()
     
     user_message = f"""
 ✅ *Оплата подтверждена!*
@@ -784,10 +947,10 @@ async def process_admin_link(message: types.Message, state: FSMContext):
 """
     
     try:
-        await bot.send_message(order["user_id"], user_message, parse_mode="Markdown", reply_markup=get_back_keyboard())
+        await bot.send_message(int(user_id), user_message, parse_mode="Markdown", reply_markup=get_back_keyboard())
         await message.answer(
             f"✅ *Заявка #{order_id} подтверждена!*\n\n"
-            f"Пользователь: @{order['username']}\n"
+            f"Пользователь: @{username}\n"
             f"Тариф: {tariff['name']}\n"
             f"Подписка действует до: {end_date.strftime('%d.%m.%Y')}\n\n"
             f"✅ Ссылка отправлена пользователю!"
@@ -803,16 +966,23 @@ async def admin_active(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
-    data = load_data()
-    active = []
-    now = datetime.now()
-    for user_id, user_data in data["users"].items():
-        if user_data.get("subscription_end"):
-            end_date = datetime.fromisoformat(user_data["subscription_end"])
-            if end_date > now:
-                days_left = (end_date - now).days
-                active.append(f"@{user_data['username']} — осталось {days_left} дн. (до {end_date.strftime('%d.%m.%Y')})")
-    text = f"📊 *Активные подписки ({len(active)})*\n\n" + ("\n".join(active) if active else "Нет активных подписок")
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute("SELECT username, subscription_end FROM users WHERE subscription_end > ?", (now,))
+    active = cursor.fetchall()
+    conn.close()
+    
+    if not active:
+        text = "📊 *Активные подписки*\n\nНет активных подписок"
+    else:
+        text = "📊 *Активные подписки*\n\n"
+        for username, sub_end in active:
+            end_date = datetime.fromisoformat(sub_end)
+            days_left = (end_date - datetime.now()).days
+            text += f"• @{username} — осталось {days_left} дн. (до {end_date.strftime('%d.%m.%Y')})\n"
+    
     await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
     await callback.answer()
 
@@ -822,36 +992,38 @@ async def admin_stats(callback: types.CallbackQuery):
         await callback.answer("Нет доступа", show_alert=True)
         return
     
-    data = load_data()
+    conn = get_connection()
+    cursor = conn.cursor()
     now = datetime.now()
     
-    total_users = len(data["users"])
+    cursor.execute("SELECT COUNT(*) FROM users")
+    total_users = cursor.fetchone()[0]
     
-    active_count = 0
-    for user_data in data["users"].values():
-        sub_end = user_data.get("subscription_end")
-        if sub_end:
-            end_date = datetime.fromisoformat(sub_end)
-            if end_date > now:
-                active_count += 1
+    cursor.execute("SELECT COUNT(*) FROM users WHERE subscription_end > ?", (now.isoformat(),))
+    active_count = cursor.fetchone()[0]
     
-    total_revenue = 0
-    monthly_revenue = 0
+    cursor.execute("SELECT SUM(price) FROM orders WHERE status = 'approved'")
+    total_revenue_row = cursor.fetchone()
+    total_revenue = total_revenue_row[0] if total_revenue_row[0] else 0
+    
     current_month = now.month
     current_year = now.year
+    cursor.execute('''
+        SELECT SUM(price) FROM orders 
+        WHERE status = 'approved' 
+        AND strftime('%m', created_at) = ? AND strftime('%Y', created_at) = ?
+    ''', (str(current_month).zfill(2), str(current_year)))
+    monthly_revenue_row = cursor.fetchone()
+    monthly_revenue = monthly_revenue_row[0] if monthly_revenue_row[0] else 0
     
-    for order in data["orders"]:
-        if order.get("status") == "approved":
-            price = order.get("price", 0)
-            total_revenue += price
-            
-            created_at = datetime.fromisoformat(order.get("created_at", now.isoformat()))
-            if created_at.month == current_month and created_at.year == current_year:
-                monthly_revenue += price
+    cursor.execute("SELECT COUNT(*) FROM users WHERE ref_count > 0")
+    users_with_refs = cursor.fetchone()[0]
     
-    total_refs = 0
-    for user_data in data["users"].values():
-        total_refs += user_data.get("ref_count", 0)
+    cursor.execute("SELECT SUM(ref_count) FROM users")
+    total_refs_row = cursor.fetchone()
+    total_refs = total_refs_row[0] if total_refs_row[0] else 0
+    
+    conn.close()
     
     stats_text = f"""
 📈 *СТАТИСТИКА GGC COMMUNITY*
@@ -861,10 +1033,11 @@ async def admin_stats(callback: types.CallbackQuery):
 • Активных подписок: {active_count}
 
 💰 *Доход:*
-• За всё время: ${total_revenue}
-• За текущий месяц: ${monthly_revenue}
+• За всё время: ${total_revenue:.2f}
+• За текущий месяц: ${monthly_revenue:.2f}
 
 👥 *Реферальная программа:*
+• Пользователей с рефералами: {users_with_refs}
 • Всего приглашений: {total_refs}
 """
     
@@ -897,16 +1070,12 @@ async def process_mass_message(message: types.Message, state: FSMContext):
         await state.clear()
         return
     
-    data = load_data()
-    now = datetime.now()
-    active_users = []
-    
-    for user_id, user_data in data["users"].items():
-        sub_end = user_data.get("subscription_end")
-        if sub_end:
-            end_date = datetime.fromisoformat(sub_end)
-            if end_date > now:
-                active_users.append(int(user_id))
+    conn = get_connection()
+    cursor = conn.cursor()
+    now = datetime.now().isoformat()
+    cursor.execute("SELECT user_id FROM users WHERE subscription_end > ?", (now,))
+    active_users = [row[0] for row in cursor.fetchall()]
+    conn.close()
     
     if not active_users:
         await message.answer("❌ Нет активных подписчиков для рассылки.")
@@ -922,7 +1091,7 @@ async def process_mass_message(message: types.Message, state: FSMContext):
         
         for user_id in active_users:
             try:
-                await bot.send_photo(user_id, photo.file_id, caption=caption, parse_mode="Markdown")
+                await bot.send_photo(int(user_id), photo.file_id, caption=caption, parse_mode="Markdown")
                 success_count += 1
                 await asyncio.sleep(0.05)
             except:
@@ -934,7 +1103,7 @@ async def process_mass_message(message: types.Message, state: FSMContext):
         
         for user_id in active_users:
             try:
-                await bot.send_document(user_id, doc.file_id, caption=caption, parse_mode="Markdown")
+                await bot.send_document(int(user_id), doc.file_id, caption=caption, parse_mode="Markdown")
                 success_count += 1
                 await asyncio.sleep(0.05)
             except:
@@ -945,7 +1114,7 @@ async def process_mass_message(message: types.Message, state: FSMContext):
         
         for user_id in active_users:
             try:
-                await bot.send_message(user_id, text, parse_mode="Markdown")
+                await bot.send_message(int(user_id), text, parse_mode="Markdown")
                 success_count += 1
                 await asyncio.sleep(0.05)
             except:
@@ -1010,10 +1179,14 @@ async def check_expiring_subscriptions():
     while True:
         try:
             reset_monthly_ref_counts()
-            data = load_data()
+            conn = get_connection()
+            cursor = conn.cursor()
             now = datetime.now()
-            for user_id, user_data in data["users"].items():
-                sub_end_str = user_data.get("subscription_end")
+            cursor.execute("SELECT user_id, subscription_end FROM users WHERE subscription_end IS NOT NULL")
+            rows = cursor.fetchall()
+            conn.close()
+            
+            for user_id, sub_end_str in rows:
                 if not sub_end_str:
                     continue
                 end_date = datetime.fromisoformat(sub_end_str)
@@ -1028,8 +1201,14 @@ async def check_expiring_subscriptions():
             await asyncio.sleep(3600)
 
 async def main():
+    # Создаём папку для базы данных, если её нет
+    os.makedirs("/data", exist_ok=True)
+    # Инициализируем базу данных
+    init_db()
+    # Запускаем фоновые задачи
     asyncio.create_task(check_expiring_subscriptions())
     print("Бот GGC Community запущен!")
+    print(f"База данных находится по пути: {DB_PATH}")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
