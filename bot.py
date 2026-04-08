@@ -1087,7 +1087,7 @@ async def process_mass_message(message: types.Message, state: FSMContext):
     
     if message.photo:
         photo = message.photo[-1]
-        caption = message.caption or "📢 *Массовое уведомление от администрации GGC*"
+        caption = message.caption or "📢 *Уведомление от администрации GGC*"
         
         for user_id in active_users:
             try:
@@ -1099,7 +1099,7 @@ async def process_mass_message(message: types.Message, state: FSMContext):
     
     elif message.document:
         doc = message.document
-        caption = message.caption or "📢 *Массовое уведомление от администрации GGC*"
+        caption = message.caption or "📢 *Уведомление от администрации GGC*"
         
         for user_id in active_users:
             try:
@@ -1110,7 +1110,7 @@ async def process_mass_message(message: types.Message, state: FSMContext):
                 fail_count += 1
     
     else:
-        text = f"📢 *Массовое уведомление от администрации GGC*\n\n{message.text}"
+        text = f"📢 *Уведомление от администрации GGC*\n\n{message.text}"
         
         for user_id in active_users:
             try:
