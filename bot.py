@@ -258,7 +258,7 @@ def get_whats_inside_text() -> str:
 
 6️⃣  *Лайв-торговля* — совместно с менторами GGC - работаем в реальном рынке. Открываем сделки, получаем результат
 
-7️⃣  *Поддержка 24/7* — составляем плана обучения, формируем торговую стратегию. Индивидуальный подход к каждому участнику"""
+7️⃣  *Поддержка 24/7* — составление плана обучения, формируем торговую стратегию. Индивидуальный подход к каждому участнику"""
 
 def get_reviews_text() -> str:
     return """
@@ -828,6 +828,91 @@ async def cmd_admin(message: types.Message):
         return
     await message.answer("🔐 *Панель администратора*\n\nВыберите действие:", parse_mode="Markdown", reply_markup=get_admin_keyboard())
 
+# НОВАЯ КОМАНДА ДЛЯ ИЗМЕНЕНИЯ ДАТЫ ОКОНЧАНИЯ ПОДПИСКИ
+@dp.message(Command("set_end_date"))
+async def cmd_set_end_date(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+    
+    args = message.text.split()
+    if len(args) != 3:
+        await message.answer(
+            "❌ *Неверный формат команды*\n\n"
+            "Использование:\n"
+            "`/set_end_date @username ДД.ММ.ГГГГ`\n\n"
+            "Пример:\n"
+            "`/set_end_date @timgymof 15.05.2025`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    username = args[1].lstrip('@')
+    new_date_str = args[2]
+    
+    # Проверяем формат даты
+    try:
+        new_end_date = datetime.strptime(new_date_str, "%d.%m.%Y")
+    except ValueError:
+        await message.answer(
+            "❌ *Неверный формат даты*\n\n"
+            "Используйте формат: `ДД.ММ.ГГГГ`\n"
+            "Пример: `15.05.2025`",
+            parse_mode="Markdown"
+        )
+        return
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Ищем пользователя по username
+    cursor.execute("SELECT user_id, subscription_end, username FROM users WHERE username = ?", (username,))
+    user = cursor.fetchone()
+    
+    if not user:
+        # Пробуем найти по @username (без @)
+        cursor.execute("SELECT user_id, subscription_end, username FROM users WHERE username = ?", (username,))
+        user = cursor.fetchone()
+    
+    if not user:
+        await message.answer(f"❌ Пользователь @{username} не найден в базе данных.")
+        conn.close()
+        return
+    
+    user_id, old_end_date_str, user_username = user
+    
+    # Обновляем дату
+    cursor.execute("UPDATE users SET subscription_end = ? WHERE user_id = ?", (new_end_date.isoformat(), user_id))
+    conn.commit()
+    conn.close()
+    
+    # Формируем ответ
+    old_end_date = datetime.fromisoformat(old_end_date_str) if old_end_date_str else None
+    old_date_str = old_end_date.strftime('%d.%m.%Y') if old_end_date else "не была установлена"
+    
+    await message.answer(
+        f"✅ *Дата окончания подписки обновлена!*\n\n"
+        f"👤 Пользователь: @{user_username}\n"
+        f"📅 Было: {old_date_str}\n"
+        f"📅 Стало: {new_end_date.strftime('%d.%m.%Y')}\n\n"
+        f"Пользователь получит уведомление об изменении.",
+        parse_mode="Markdown"
+    )
+    
+    # Отправляем уведомление пользователю
+    try:
+        await bot.send_message(
+            int(user_id),
+            f"📅 *Изменение даты подписки*\n\n"
+            f"Администратор изменил дату окончания вашей подписки.\n"
+            f"Новая дата: *{new_end_date.strftime('%d.%m.%Y')}*\n\n"
+            f"Если у вас есть вопросы — напишите в поддержку.",
+            parse_mode="Markdown",
+            reply_markup=get_back_keyboard()
+        )
+    except Exception as e:
+        await message.answer(f"⚠️ Не удалось отправить уведомление пользователю: {e}")
+
 @dp.callback_query(lambda c: c.data == "admin_view_orders")
 async def admin_view_orders(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1201,7 +1286,7 @@ async def check_expiring_subscriptions():
             await asyncio.sleep(3600)
 
 async def main():
-    # Создаём папку для базы данных, если её нет
+    # Создаем папку для базы данных, если её нет
     os.makedirs("/data", exist_ok=True)
     # Инициализируем базу данных
     init_db()
