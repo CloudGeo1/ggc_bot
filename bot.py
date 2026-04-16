@@ -399,6 +399,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
             VALUES (?, ?, ?, ?, ?, ?, ?)
         ''', (user_id, username, now_str, None, ref_code_gen, invited_by, now_str))
         
+        # --- ЛОГИКА ПРИГЛАШЕНИЯ (БЕЗ ВЫДАЧИ ПРОМОКОДА) ---
         if invited_by:
             # Увеличиваем счётчик приглашений
             cursor.execute("UPDATE users SET ref_count = ref_count + 1, ref_monthly_count = ref_monthly_count + 1 WHERE user_id = ?", (invited_by,))
@@ -411,53 +412,19 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 if (datetime.now() - last_reset_date).days >= 30:
                     cursor.execute("UPDATE users SET ref_monthly_count = 1, ref_monthly_reset = ? WHERE user_id = ?", (datetime.now().isoformat(), invited_by))
             
-            # Генерируем промокод для пригласившего
-            promo_code = f"REF{user_id}_{random.randint(1000, 9999)}"
-            cursor.execute('''
-                INSERT INTO ref_promocodes (user_id, code, discount, created_at, from_user)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (invited_by, promo_code, 10, datetime.now().isoformat(), username))
-            
+            # Отправляем уведомление о новом реферале, но БЕЗ ПРОМОКОДА
             try:
                 await bot.send_message(
                     int(invited_by),
-                    f"🎉 *Новый реферал!*\n\n"
-                    f"Пользователь @{username} перешёл по вашей ссылке!\n"
-                    f"Вы получили промокод на скидку 10$: `{promo_code}`\n\n"
+                    f"🔔 *Новый реферал!*\n\n"
+                    f"Пользователь @{username} перешёл по вашей ссылке и зарегистрировался.\n"
+                    f"💰 Промокод на скидку 10$ будет начислен *после оплаты подписки* новым пользователем.\n\n"
                     f"Всего приглашений: (обновится позже)\n"
                     f"За этот месяц: (обновится позже)",
                     parse_mode="Markdown"
                 )
             except:
                 pass
-            
-            # Проверяем, не набрал ли пригласивший 3 реферала за месяц
-            cursor.execute("SELECT ref_monthly_count, ref_free_month_used, subscription_end FROM users WHERE user_id = ?", (invited_by,))
-            inviter_data = cursor.fetchone()
-            if inviter_data and inviter_data[0] >= 3 and not inviter_data[1]:
-                current_end = inviter_data[2]
-                if current_end:
-                    end_date = datetime.fromisoformat(current_end)
-                    if end_date > datetime.now():
-                        new_end = end_date + timedelta(days=30)
-                    else:
-                        new_end = datetime.now() + timedelta(days=30)
-                else:
-                    new_end = datetime.now() + timedelta(days=30)
-                
-                cursor.execute("UPDATE users SET subscription_end = ?, ref_free_month_used = 1 WHERE user_id = ?", (new_end.isoformat(), invited_by))
-                
-                try:
-                    await bot.send_message(
-                        int(invited_by),
-                        f"🎁 *Бесплатный месяц подписки!*\n\n"
-                        f"Вы пригласили 3 друзей за месяц!\n"
-                        f"Ваша подписка продлена до {new_end.strftime('%d.%m.%Y')}\n\n"
-                        f"Продолжайте приглашать — новые бонусы ждут!",
-                        parse_mode="Markdown"
-                    )
-                except:
-                    pass
         
         conn.commit()
     
@@ -554,16 +521,17 @@ async def show_referral_info(msg: types.Message, user_id: int):
 • За этот месяц: {ref_monthly}
 
 🎁 *Бонусы:*
-• За 1 приглашение → промокод на скидку 10$
+• За 1 приглашение → промокод на скидку 10$ (выдаётся ПОСЛЕ оплаты подписки новым пользователем)
 • За 3 приглашения за месяц → бесплатный месяц подписки
 
 {f"✅ *Бесплатный месяц уже получен!*" if free_month_used else "⚠️ *До бесплатного месяца:* " + str(3 - min(ref_monthly, 3)) + " приглашений"}
 
 *Как это работает:*
 1. Отправьте ссылку другу
-2. Друг регистрируется и покупает подписку
-3. Вы получаете промокод на 10$
-4. Пригласите 3 друзей за месяц — получите месяц бесплатно
+2. Друг переходит по ссылке и регистрируется
+3. Друг покупает подписку
+4. Вы получаете промокод на 10$ и +1 к счётчику
+5. Пригласите 3 друзей за месяц — получите месяц бесплатно
 """
     
     await msg.answer(text, parse_mode="Markdown", reply_markup=get_referral_keyboard())
@@ -600,7 +568,7 @@ async def my_promocodes(callback: types.CallbackQuery):
     active_codes = [row for row in rows if not row[3]]
     
     if not active_codes:
-        text = "🎟 *Ваши промокоды*\n\nУ вас пока нет активных промокодов.\nПригласите друга, и вы получите скидку 10$!"
+        text = "🎟 *Ваши промокоды*\n\nУ вас пока нет активных промокодов.\nПригласите друга, и после его оплаты вы получите скидку 10$!"
     else:
         text = "🎟 *Ваши промокоды:*\n\n"
         for p in active_codes:
@@ -999,10 +967,10 @@ async def process_admin_link(message: types.Message, state: FSMContext):
     
     user_id, username, tariff_key = order
     
-    # Обновляем статус заявки
+    # --- 1. Обновляем статус заявки ---
     cursor.execute("UPDATE orders SET status = 'approved' WHERE order_id = ?", (order_id,))
     
-    # Активируем подписку
+    # --- 2. Активируем подписку ---
     tariff = TARIFFS[tariff_key]
     end_date = datetime.now() + timedelta(days=tariff["days"])
     
@@ -1015,9 +983,35 @@ async def process_admin_link(message: types.Message, state: FSMContext):
     else:
         cursor.execute("UPDATE users SET subscription_end = ? WHERE user_id = ?", (end_date.isoformat(), user_id))
     
+    # --- 3. ВЫДАЁМ РЕФЕРАЛЬНЫЙ ПРОМОКОД (ЕСЛИ ЕСТЬ ПРИГЛАСИВШИЙ) ---
+    cursor.execute("SELECT ref_by FROM users WHERE user_id = ?", (user_id,))
+    ref_result = cursor.fetchone()
+    if ref_result and ref_result[0]:
+        inviter_id = ref_result[0]
+        # Генерируем уникальный промокод для пригласившего
+        promo_code = f"REF{user_id}_{random.randint(1000, 9999)}"
+        cursor.execute('''
+            INSERT INTO ref_promocodes (user_id, code, discount, created_at, from_user)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (inviter_id, promo_code, 10, datetime.now().isoformat(), username))
+        
+        # Отправляем уведомление пригласившему
+        try:
+            await bot.send_message(
+                int(inviter_id),
+                f"🎉 *Вы получили промокод!*\n\n"
+                f"Пользователь @{username}, которого вы пригласили, только что оплатил подписку!\n"
+                f"Ваш промокод на скидку 10$: `{promo_code}`\n\n"
+                f"Спасибо, что делитесь GGC!",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Не удалось отправить промокод пригласившему {inviter_id}: {e}")
+    
     conn.commit()
     conn.close()
     
+    # --- 4. Отправляем ссылку пользователю ---
     user_message = f"""
 ✅ *Оплата подтверждена!*
 
