@@ -896,21 +896,24 @@ async def admin_view_orders(callback: types.CallbackQuery):
         conn.close()
         
         if not pending_orders:
-            await callback.message.edit_text("📭 *Нет новых заявок*", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+            await callback.message.edit_text("📭 Нет новых заявок", reply_markup=get_admin_keyboard())
         else:
-            text = "📋 *Заявки на подтверждение:*\n\n"
+            text = "📋 Заявки на подтверждение:\n\n"
             for o in pending_orders:
-                text += f"🆕 #{o[0]} | @{o[1]} | ${o[2]}\n"
+                # Экранируем username для Markdown
+                safe_username = o[1].replace('_', '\\_')
+                text += f"🆕 #{o[0]} | @{safe_username} | ${o[2]}\n"
             
             builder = InlineKeyboardBuilder()
             for o in pending_orders:
-                builder.button(text=f"#{o[0]} - @{o[1]}", callback_data=f"approve_{o[0]}")
+                safe_username = o[1].replace('_', '\\_')
+                builder.button(text=f"#{o[0]} - @{safe_username}", callback_data=f"approve_{o[0]}")
             builder.button(text="◀️ Назад", callback_data="back_to_menu")
             builder.adjust(1)
             
-            await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+            await callback.message.edit_text(text, reply_markup=builder.as_markup())
     except Exception as e:
-        await callback.message.edit_text(f"❌ *Ошибка при загрузке заявок:*\n\n`{e}`", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+        await callback.message.edit_text(f"❌ Ошибка при загрузке заявок:\n\n{str(e)}", reply_markup=get_admin_keyboard())
     
     await callback.answer()
 
