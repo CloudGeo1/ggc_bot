@@ -881,7 +881,7 @@ async def cmd_set_end_date(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"⚠️ Не удалось отправить уведомление пользователю: {e}")
 
-# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ ПРОСМОТРА ЗАЯВОК ====================
+# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ ПРОСМОТРА ЗАЯВОК (С УДАЛЕНИЕМ) ====================
 @dp.callback_query(lambda c: c.data == "admin_view_orders")
 async def admin_view_orders(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -907,7 +907,8 @@ async def admin_view_orders(callback: types.CallbackQuery):
             builder = InlineKeyboardBuilder()
             for o in pending_orders:
                 safe_username = o[1].replace('_', '\\_')
-                builder.button(text=f"#{o[0]} - @{safe_username}", callback_data=f"approve_{o[0]}")
+                builder.button(text=f"✅ #{o[0]} - @{safe_username}", callback_data=f"approve_{o[0]}")
+                builder.button(text=f"🗑️ Удалить #{o[0]}", callback_data=f"delete_{o[0]}")
             builder.button(text="◀️ Назад", callback_data="back_to_menu")
             builder.adjust(1)
             
@@ -915,6 +916,48 @@ async def admin_view_orders(callback: types.CallbackQuery):
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка при загрузке заявок:\n\n{str(e)}", reply_markup=get_admin_keyboard())
     
+    await callback.answer()
+
+# НОВАЯ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ ЗАЯВКИ
+@dp.callback_query(lambda c: c.data.startswith("delete_"))
+async def admin_delete_order(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    order_id = int(callback.data.replace("delete_", ""))
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Получаем информацию о заявке перед удалением (для статистики)
+    cursor.execute("SELECT user_id, username, price FROM orders WHERE order_id = ?", (order_id,))
+    order = cursor.fetchone()
+    
+    if not order:
+        await callback.answer("Заявка не найдена", show_alert=True)
+        conn.close()
+        return
+    
+    user_id, username, price = order
+    
+    # Удаляем заявку из базы
+    cursor.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
+    conn.commit()
+    conn.close()
+    
+    # Отправляем уведомление админу
+    await callback.message.answer(
+        f"✅ *Заявка #{order_id} удалена!*\n\n"
+        f"Пользователь: @{username}\n"
+        f"Сумма: ${price}\n\n"
+        f"Статистика доходов пересчитана автоматически.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_keyboard()
+    )
+    
+    # Обновляем список заявок (перезагружаем админ-панель просмотра)
+    await admin_view_orders(callback, state)
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("approve_"))
@@ -1048,6 +1091,7 @@ async def process_admin_link(message: types.Message, state: FSMContext):
     await message.answer("🔐 *Панель администратора*\n\nВыберите действие:", parse_mode="Markdown", reply_markup=get_admin_keyboard())
     await state.clear()
 
+# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ АКТИВНЫЕ ПОДПИСКИ ====================
 @dp.callback_query(lambda c: c.data == "admin_active")
 async def admin_active(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1062,15 +1106,17 @@ async def admin_active(callback: types.CallbackQuery):
     conn.close()
     
     if not active:
-        text = "📊 *Активные подписки*\n\nНет активных подписок"
+        text = "📊 Активные подписки\n\nНет активных подписок"
     else:
-        text = "📊 *Активные подписки*\n\n"
+        text = "📊 Активные подписки\n\n"
         for username, sub_end in active:
             end_date = datetime.fromisoformat(sub_end)
             days_left = (end_date - datetime.now()).days
-            text += f"• @{username} — осталось {days_left} дн. (до {end_date.strftime('%d.%m.%Y')})\n"
+            # Экранируем username для Markdown
+            safe_username = username.replace('_', '\\_')
+            text += f"• @{safe_username} — осталось {days_left} дн. (до {end_date.strftime('%d.%m.%Y')})\n"
     
-    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+    await callback.message.edit_text(text, reply_markup=get_admin_keyboard())
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data == "admin_stats")
