@@ -881,32 +881,37 @@ async def cmd_set_end_date(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"⚠️ Не удалось отправить уведомление пользователю: {e}")
 
+# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ ПРОСМОТРА ЗАЯВОК ====================
 @dp.callback_query(lambda c: c.data == "admin_view_orders")
 async def admin_view_orders(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer("Нет доступа", show_alert=True)
         return
     
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT order_id, username, price FROM orders WHERE status = 'pending'")
-    pending_orders = cursor.fetchall()
-    conn.close()
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT order_id, username, price FROM orders WHERE status = 'pending'")
+        pending_orders = cursor.fetchall()
+        conn.close()
+        
+        if not pending_orders:
+            await callback.message.edit_text("📭 *Нет новых заявок*", parse_mode="Markdown", reply_markup=get_admin_keyboard())
+        else:
+            text = "📋 *Заявки на подтверждение:*\n\n"
+            for o in pending_orders:
+                text += f"🆕 #{o[0]} | @{o[1]} | ${o[2]}\n"
+            
+            builder = InlineKeyboardBuilder()
+            for o in pending_orders:
+                builder.button(text=f"#{o[0]} - @{o[1]}", callback_data=f"approve_{o[0]}")
+            builder.button(text="◀️ Назад", callback_data="back_to_menu")
+            builder.adjust(1)
+            
+            await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
+    except Exception as e:
+        await callback.message.edit_text(f"❌ *Ошибка при загрузке заявок:*\n\n`{e}`", parse_mode="Markdown", reply_markup=get_admin_keyboard())
     
-    if not pending_orders:
-        await callback.message.edit_text("📭 *Нет новых заявок*", parse_mode="Markdown", reply_markup=get_admin_keyboard())
-    else:
-        text = "📋 *Заявки на подтверждение:*\n\n"
-        for o in pending_orders:
-            text += f"🆕 #{o[0]} | @{o[1]} | ${o[2]}\n"
-        
-        builder = InlineKeyboardBuilder()
-        for o in pending_orders:
-            builder.button(text=f"#{o[0]} - @{o[1]}", callback_data=f"approve_{o[0]}")
-        builder.button(text="◀️ Назад", callback_data="back_to_menu")
-        builder.adjust(1)
-        
-        await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=builder.as_markup())
     await callback.answer()
 
 @dp.callback_query(lambda c: c.data.startswith("approve_"))
