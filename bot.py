@@ -2,6 +2,7 @@ import asyncio
 import os
 import random
 import sqlite3
+import json
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -39,7 +40,8 @@ TARIFFS = {
 }
 
 PROMOCODES = {
-    "GGC10": 10
+    "GGC10": 10,   # 10% скидка
+    "GGC40": 40    # 40% скидка
 }
 # =====================================================
 
@@ -111,6 +113,18 @@ def init_db():
         )
     ''')
     
+    # Таблица журнала активности
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            username TEXT,
+            action TEXT,
+            details TEXT,
+            created_at TEXT
+        )
+    ''')
+    
     conn.commit()
     conn.close()
 
@@ -123,6 +137,7 @@ def reset_db():
     cursor.execute("DROP TABLE IF EXISTS users")
     cursor.execute("DROP TABLE IF EXISTS ref_promocodes")
     cursor.execute("DROP TABLE IF EXISTS orders")
+    cursor.execute("DROP TABLE IF EXISTS activity_log")
     
     conn.commit()
     conn.close()
@@ -133,6 +148,20 @@ def reset_db():
 def get_connection():
     """Возвращает соединение с базой данных"""
     return sqlite3.connect(DB_PATH)
+
+def log_activity(user_id: str, username: str, action: str, details: str = ""):
+    """Запись события в журнал активности"""
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT INTO activity_log (user_id, username, action, details, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, username, action, details, datetime.now().isoformat())
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"Ошибка при записи в журнал: {e}")
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 
@@ -219,6 +248,8 @@ def get_admin_keyboard() -> InlineKeyboardMarkup:
     builder.button(text="📊 Активные подписки", callback_data="admin_active")
     builder.button(text="📈 Статистика", callback_data="admin_stats")
     builder.button(text="📢 Массовое уведомление", callback_data="admin_mass_message")
+    builder.button(text="📋 Журнал активности", callback_data="admin_logs")
+    builder.button(text="🔍 Поиск пользователя", callback_data="admin_search_user")
     builder.button(text="🔙 Выйти", callback_data="back_to_menu")
     builder.adjust(1)
     return builder.as_markup()
@@ -327,7 +358,8 @@ async def cmd_reset_db(message: types.Message, state: FSMContext):
         "• Все пользователи\n"
         "• Все подписки\n"
         "• Все заявки\n"
-        "• Все реферальные промокоды\n\n"
+        "• Все реферальные промокоды\n"
+        "• Весь журнал активности\n\n"
         "Это действие НЕЛЬЗЯ отменить.\n\n"
         "Вы уверены?",
         parse_mode="Markdown",
@@ -372,6 +404,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     user_id = str(message.from_user.id)
     username = message.from_user.username or message.from_user.first_name
+    
+    # Логируем вход
+    log_activity(user_id, username, "start", "Пользователь запустил бота")
     
     ref_code = None
     if message.text and " " in message.text:
@@ -425,6 +460,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
                 )
             except:
                 pass
+            
+            # Логируем реферала
+            log_activity(invited_by, "inviter", "ref_registration", f"Новый реферал @{username} зарегистрировался по ссылке")
         
         conn.commit()
     
@@ -440,14 +478,18 @@ async def main_menu_button(message: types.Message, state: FSMContext):
 async def handle_bottom_buttons(message: types.Message, state: FSMContext):
     await state.clear()
     text = message.text
+    user_id = str(message.from_user.id)
+    username = message.from_user.username or message.from_user.first_name
     
     if text == "💰 Купить":
+        log_activity(user_id, username, "buy_button", "Нажата кнопка 'Купить'")
         await message.answer(
             "💳 *Выбери тариф подписки:*\n\n_После выбора ты сможешь ввести промокод при наличии._",
             parse_mode="Markdown",
             reply_markup=get_tariff_keyboard()
         )
     elif text == "👥 Рефералка":
+        log_activity(user_id, username, "referral_button", "Нажата кнопка 'Рефералка'")
         await show_referral_info(message, message.from_user.id)
     elif text == "👤 Статус":
         conn = get_connection()
@@ -588,6 +630,10 @@ async def handle_tariff(callback: types.CallbackQuery, state: FSMContext):
         return
     
     tariff = TARIFFS[tariff_key]
+    user_id = str(callback.from_user.id)
+    username = callback.from_user.username or callback.from_user.first_name
+    log_activity(user_id, username, "select_tariff", f"Выбран тариф {tariff['name']} (${tariff['price']})")
+    
     await state.update_data(tariff=tariff_key, price=tariff["price"])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -605,29 +651,39 @@ async def handle_tariff(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data in ["has_promo", "no_promo"])
 async def handle_promo_choice(callback: types.CallbackQuery, state: FSMContext):
+    user_id = str(callback.from_user.id)
+    username = callback.from_user.username or callback.from_user.first_name
+    
     if callback.data == "has_promo":
+        log_activity(user_id, username, "enter_promo", "Пользователь начал ввод промокода")
         await callback.message.edit_text(
             "🎟 *Введите промокод:*\n\nНапишите код в сообщении.\n\nДля отмены введите /cancel",
             parse_mode="Markdown"
         )
         await state.set_state(OrderState.entering_promo)
     else:
-        await state.update_data(discount=0, promo_code=None)
+        log_activity(user_id, username, "no_promo", "Пользователь продолжил без промокода")
+        await state.update_data(discount_percent=0, discount_fixed=0, promo_code=None, is_ref_promo=False)
         await show_payment_info(callback.message, state)
     await callback.answer()
 
+# ИЗМЕНЁННАЯ ФУНКЦИЯ ОБРАБОТКИ ПРОМОКОДА
 @dp.message(OrderState.entering_promo)
 async def process_promo(message: types.Message, state: FSMContext):
     promo = message.text.strip().upper()
-    discount = 0
+    user_id = str(message.from_user.id)
+    username = message.from_user.username or message.from_user.first_name
     
+    # Проверяем системные промокоды (процентные)
     if promo in PROMOCODES:
-        discount = PROMOCODES[promo]
-        await state.update_data(discount=discount, promo_code=promo, is_ref_promo=False)
-        await message.answer(f"✅ Промокод применён! Скидка ${discount}")
+        percent = PROMOCODES[promo]
+        log_activity(user_id, username, "promo_applied", f"Системный промокод {promo} ({percent}%)")
+        await state.update_data(discount_percent=percent, discount_fixed=0, promo_code=promo, is_ref_promo=False)
+        await message.answer(f"✅ Промокод применён! Скидка {percent}%")
         await show_payment_info(message, state)
         return
     
+    # Проверяем реферальные промокоды (фиксированные 10$)
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT user_id, discount FROM ref_promocodes WHERE code = ? AND used = 0", (promo,))
@@ -637,7 +693,8 @@ async def process_promo(message: types.Message, state: FSMContext):
         discount = row[1]
         cursor.execute("UPDATE ref_promocodes SET used = 1 WHERE code = ?", (promo,))
         conn.commit()
-        await state.update_data(discount=discount, promo_code=promo, is_ref_promo=True)
+        log_activity(user_id, username, "promo_applied", f"Реферальный промокод {promo} ($10)")
+        await state.update_data(discount_percent=0, discount_fixed=discount, promo_code=promo, is_ref_promo=True)
         await message.answer(f"✅ Реферальный промокод применён! Скидка ${discount}")
         await show_payment_info(message, state)
         conn.close()
@@ -645,6 +702,7 @@ async def process_promo(message: types.Message, state: FSMContext):
     
     conn.close()
     
+    log_activity(user_id, username, "promo_invalid", f"Неверный промокод {promo}")
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Попробовать другой", callback_data="has_promo")],
         [InlineKeyboardButton(text="🚫 Продолжить без промокода", callback_data="no_promo")]
@@ -654,15 +712,30 @@ async def process_promo(message: types.Message, state: FSMContext):
         reply_markup=keyboard
     )
 
+# ИЗМЕНЁННАЯ ФУНКЦИЯ ПОКАЗА ПЛАТЕЖНОЙ ИНФОРМАЦИИ
 async def show_payment_info(msg: types.Message, state: FSMContext):
     data = await state.get_data()
     tariff_key = data["tariff"]
     tariff = TARIFFS[tariff_key]
     base_price = tariff["price"]
-    discount = data.get("discount", 0)
-    final_price = base_price - discount
     
-    await state.update_data(final_price=final_price)
+    # Получаем скидку
+    discount_percent = data.get("discount_percent", 0)
+    discount_fixed = data.get("discount_fixed", 0)
+    is_ref_promo = data.get("is_ref_promo", False)
+    
+    if is_ref_promo:
+        # Реферальный промокод – фиксированная скидка
+        discount_amount = discount_fixed
+        discount_display = f"${discount_amount}"
+    else:
+        # Системный промокод – процент
+        discount_amount = int(base_price * discount_percent / 100)
+        discount_display = f"{discount_percent}% (${discount_amount})"
+    
+    final_price = base_price - discount_amount
+    
+    await state.update_data(final_price=final_price, discount=discount_amount)
     
     order_id = random.randint(100000, 999999)
     await state.update_data(order_id=order_id)
@@ -678,7 +751,7 @@ async def show_payment_info(msg: types.Message, state: FSMContext):
 
 Тариф: {tariff['name']}
 Базовая цена: ${base_price}
-Скидка: ${discount}
+Скидка: {discount_display}
 *Итого к оплате: ${final_price}*
 
 Выберите сеть для оплаты USDT:
@@ -690,6 +763,10 @@ async def handle_network(callback: types.CallbackQuery, state: FSMContext):
     parts = callback.data.split("_")
     network = parts[1]
     order_id = int(parts[2])
+    user_id = str(callback.from_user.id)
+    username = callback.from_user.username or callback.from_user.first_name
+    log_activity(user_id, username, "select_network", f"Выбрана сеть {network} для заказа #{order_id}")
+    
     await state.update_data(network=network, order_id=order_id)
     
     wallet_address = WALLETS[network]
@@ -718,6 +795,10 @@ async def handle_network(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data == "paid")
 async def handle_paid(callback: types.CallbackQuery, state: FSMContext):
+    user_id = str(callback.from_user.id)
+    username = callback.from_user.username or callback.from_user.first_name
+    log_activity(user_id, username, "paid_button", "Пользователь нажал 'Я оплатил'")
+    
     await callback.message.edit_text(
         "📸 *Отправьте скриншот оплаты*\n\nПришлите фото или скриншот, подтверждающий перевод.\nАдминистратор проверит и подтвердит доступ.\n\nДля отмены введите /cancel",
         parse_mode="Markdown"
@@ -736,6 +817,8 @@ async def process_screenshot(message: types.Message, state: FSMContext):
     price = data["final_price"]
     network = data.get("network")
     promo = data.get("promo_code")
+    
+    log_activity(user_id, username, "screenshot_sent", f"Отправлен скриншот для заказа #{order_id}, сумма ${price}")
     
     conn = get_connection()
     cursor = conn.cursor()
@@ -881,7 +964,9 @@ async def cmd_set_end_date(message: types.Message, state: FSMContext):
     except Exception as e:
         await message.answer(f"⚠️ Не удалось отправить уведомление пользователю: {e}")
 
-# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ ПРОСМОТРА ЗАЯВОК (С УДАЛЕНИЕМ) ====================
+# ==================== АДМИНСКИЕ ФУНКЦИИ ====================
+
+# ПРОСМОТР ЗАЯВОК (С УДАЛЕНИЕМ)
 @dp.callback_query(lambda c: c.data == "admin_view_orders")
 async def admin_view_orders(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -918,7 +1003,7 @@ async def admin_view_orders(callback: types.CallbackQuery):
     
     await callback.answer()
 
-# НОВАЯ ФУНКЦИЯ ДЛЯ УДАЛЕНИЯ ЗАЯВКИ
+# УДАЛЕНИЕ ЗАЯВКИ
 @dp.callback_query(lambda c: c.data.startswith("delete_"))
 async def admin_delete_order(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -930,7 +1015,7 @@ async def admin_delete_order(callback: types.CallbackQuery, state: FSMContext):
     conn = get_connection()
     cursor = conn.cursor()
     
-    # Получаем информацию о заявке перед удалением (для статистики)
+    # Получаем информацию о заявке перед удалением
     cursor.execute("SELECT user_id, username, price FROM orders WHERE order_id = ?", (order_id,))
     order = cursor.fetchone()
     
@@ -941,12 +1026,14 @@ async def admin_delete_order(callback: types.CallbackQuery, state: FSMContext):
     
     user_id, username, price = order
     
+    # Логируем удаление
+    log_activity(user_id, username, "order_deleted", f"Заявка #{order_id} удалена админом, сумма ${price}")
+    
     # Удаляем заявку из базы
     cursor.execute("DELETE FROM orders WHERE order_id = ?", (order_id,))
     conn.commit()
     conn.close()
     
-    # Отправляем уведомление админу
     await callback.message.answer(
         f"✅ *Заявка #{order_id} удалена!*\n\n"
         f"Пользователь: @{username}\n"
@@ -956,10 +1043,11 @@ async def admin_delete_order(callback: types.CallbackQuery, state: FSMContext):
         reply_markup=get_admin_keyboard()
     )
     
-    # Обновляем список заявок (перезагружаем админ-панель просмотра)
+    # Обновляем список заявок
     await admin_view_orders(callback, state)
     await callback.answer()
 
+# ПОДТВЕРЖДЕНИЕ ЗАЯВКИ (С ЛОГИРОВАНИЕМ)
 @dp.callback_query(lambda c: c.data.startswith("approve_"))
 async def admin_approve_order(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -1046,6 +1134,9 @@ async def process_admin_link(message: types.Message, state: FSMContext):
             VALUES (?, ?, ?, ?, ?)
         ''', (inviter_id, promo_code, 10, datetime.now().isoformat(), username))
         
+        # Логируем выдачу промокода
+        log_activity(inviter_id, "inviter", "ref_promo_generated", f"Реферальный промокод {promo_code} выдан за приглашение @{username}")
+        
         # Отправляем уведомление пригласившему
         try:
             await bot.send_message(
@@ -1058,6 +1149,9 @@ async def process_admin_link(message: types.Message, state: FSMContext):
             )
         except Exception as e:
             print(f"Не удалось отправить промокод пригласившему {inviter_id}: {e}")
+    
+    # Логируем подтверждение
+    log_activity(user_id, username, "subscription_approved", f"Подписка активирована до {end_date.strftime('%d.%m.%Y')}, заказ #{order_id}")
     
     conn.commit()
     conn.close()
@@ -1091,7 +1185,7 @@ async def process_admin_link(message: types.Message, state: FSMContext):
     await message.answer("🔐 *Панель администратора*\n\nВыберите действие:", parse_mode="Markdown", reply_markup=get_admin_keyboard())
     await state.clear()
 
-# ==================== ИСПРАВЛЕННАЯ ФУНКЦИЯ АКТИВНЫЕ ПОДПИСКИ ====================
+# АКТИВНЫЕ ПОДПИСКИ
 @dp.callback_query(lambda c: c.data == "admin_active")
 async def admin_active(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1112,13 +1206,13 @@ async def admin_active(callback: types.CallbackQuery):
         for username, sub_end in active:
             end_date = datetime.fromisoformat(sub_end)
             days_left = (end_date - datetime.now()).days
-            # Экранируем username для Markdown
             safe_username = username.replace('_', '\\_')
             text += f"• @{safe_username} — осталось {days_left} дн. (до {end_date.strftime('%d.%m.%Y')})\n"
     
     await callback.message.edit_text(text, reply_markup=get_admin_keyboard())
     await callback.answer()
 
+# СТАТИСТИКА
 @dp.callback_query(lambda c: c.data == "admin_stats")
 async def admin_stats(callback: types.CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -1177,6 +1271,7 @@ async def admin_stats(callback: types.CallbackQuery):
     await callback.message.edit_text(stats_text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
     await callback.answer()
 
+# МАССОВОЕ УВЕДОМЛЕНИЕ
 @dp.callback_query(lambda c: c.data == "admin_mass_message")
 async def admin_mass_message(callback: types.CallbackQuery, state: FSMContext):
     if not is_admin(callback.from_user.id):
@@ -1264,6 +1359,107 @@ async def process_mass_message(message: types.Message, state: FSMContext):
     await message.answer("🔐 *Панель администратора*\n\nВыберите действие:", parse_mode="Markdown", reply_markup=get_admin_keyboard())
     await state.clear()
 
+# ЖУРНАЛ АКТИВНОСТИ
+@dp.callback_query(lambda c: c.data == "admin_logs")
+async def admin_logs(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, username, action, details, created_at FROM activity_log ORDER BY created_at DESC LIMIT 50")
+    rows = cursor.fetchall()
+    conn.close()
+    
+    if not rows:
+        await callback.message.edit_text("📋 Журнал активности\n\nПока нет записей.", reply_markup=get_admin_keyboard())
+        return
+    
+    text = "📋 *Журнал активности (последние 50 событий):*\n\n"
+    for row in rows:
+        user_id, username, action, details, created_at = row
+        time_str = datetime.fromisoformat(created_at).strftime("%d.%m %H:%M")
+        safe_username = username.replace('_', '\\_') if username else "unknown"
+        text += f"`{time_str}` @{safe_username} | *{action}*\n"
+        if details:
+            text += f"   └ {details}\n"
+        text += "\n"
+    
+    if len(text) > 4000:
+        text = text[:4000] + "\n... (обрезано)"
+    
+    await callback.message.edit_text(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+    await callback.answer()
+
+# ПОИСК ПОЛЬЗОВАТЕЛЯ
+@dp.callback_query(lambda c: c.data == "admin_search_user")
+async def admin_search_user(callback: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "🔍 *Поиск пользователя*\n\n"
+        "Введите username (с @ или без) или Telegram ID:\n"
+        "Примеры: `@timgymof` или `123456789`\n\n"
+        "Для отмены введите /cancel",
+        parse_mode="Markdown"
+    )
+    await state.set_state("waiting_for_search_query")
+    await callback.answer()
+
+@dp.message(lambda message: message.state and message.state.state == "waiting_for_search_query")
+async def process_search_query(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        await message.answer("⛔ Нет доступа")
+        await state.clear()
+        return
+    
+    query = message.text.strip()
+    user_id = query.lstrip('@')
+    
+    conn = get_connection()
+    cursor = conn.cursor()
+    
+    # Пробуем найти по ID или username
+    cursor.execute("SELECT user_id, username, subscription_end, ref_count FROM users WHERE user_id = ? OR username = ?", (user_id, user_id))
+    user = cursor.fetchone()
+    
+    if not user:
+        await message.answer("❌ Пользователь не найден.", reply_markup=get_admin_keyboard())
+        conn.close()
+        await state.clear()
+        return
+    
+    found_user_id, username, sub_end, ref_count = user
+    
+    # Получаем последние действия из логов
+    cursor.execute("SELECT action, details, created_at FROM activity_log WHERE user_id = ? ORDER BY created_at DESC LIMIT 10", (found_user_id,))
+    logs = cursor.fetchall()
+    conn.close()
+    
+    text = f"👤 *Информация о пользователе*\n\n"
+    text += f"ID: `{found_user_id}`\n"
+    text += f"Username: @{username}\n"
+    text += f"Подписка: {'Активна до ' + datetime.fromisoformat(sub_end).strftime('%d.%m.%Y') if sub_end else 'Нет активной'}\n"
+    text += f"Рефералов: {ref_count}\n\n"
+    
+    if logs:
+        text += "📋 *Последние действия:*\n"
+        for action, details, created_at in logs:
+            time_str = datetime.fromisoformat(created_at).strftime("%d.%m %H:%M")
+            text += f"`{time_str}` {action}"
+            if details:
+                text += f" — {details}"
+            text += "\n"
+    else:
+        text += "Нет записей в журнале."
+    
+    await message.answer(text, parse_mode="Markdown", reply_markup=get_admin_keyboard())
+    await state.clear()
+
+# ПОДДЕРЖКА
 @dp.callback_query(lambda c: c.data == "write_to_support")
 async def write_to_support(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text(
@@ -1317,7 +1513,6 @@ async def check_expiring_subscriptions():
             now = datetime.now()
             cursor.execute("SELECT user_id, subscription_end FROM users WHERE subscription_end IS NOT NULL")
             rows = cursor.fetchall()
-            conn.close()
             
             for user_id, sub_end_str in rows:
                 if not sub_end_str:
@@ -1326,8 +1521,14 @@ async def check_expiring_subscriptions():
                 days_left = (end_date - now).days
                 if days_left == 7:
                     await bot.send_message(int(user_id), f"⏰ *Напоминание:* Ваша подписка истекает через 7 дней — {end_date.strftime('%d.%m.%Y')}\n\nПродлите доступ, чтобы не потерять связь с комьюнити!", parse_mode="Markdown")
+                    log_activity(user_id, "system", "reminder_7days", f"Напоминание за 7 дней до {end_date.strftime('%d.%m.%Y')}")
                 elif days_left == 3:
                     await bot.send_message(int(user_id), f"⚠️ *Подписка истекает через 3 дня!*\n\nДата окончания: {end_date.strftime('%d.%m.%Y')}\nНажмите /start и выберите «Купить подписку» для продления.", parse_mode="Markdown")
+                    log_activity(user_id, "system", "reminder_3days", f"Напоминание за 3 дня до {end_date.strftime('%d.%m.%Y')}")
+                elif days_left == 0:
+                    log_activity(user_id, "system", "subscription_expired", f"Подписка истекла {end_date.strftime('%d.%m.%Y')}")
+            
+            conn.close()
             await asyncio.sleep(86400)
         except Exception as e:
             print(f"Ошибка в фоновой задаче: {e}")
